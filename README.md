@@ -1,0 +1,1 @@
+# xmc45_hid_example
