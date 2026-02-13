@@ -23,8 +23,17 @@
 // IIR configuration: shift-only alpha = 1/2^N
 #define IIR_SHIFT_N         3       // N=3 -> alpha = 0.125 ~ 20 Hz cutoff @ 1 kHz update
 
-#define DEADBAND 10  // in oversampled-count units (~13-bit domain)
+#define DEADBAND 2  // in oversampled-count units (~13-bit domain)
 #define AVG_CENTER_POS 1024
+
+typedef struct {
+    uint8_t use_q15;   // 0: shift-only, 1: Q15
+    uint8_t N;         // used if use_q15 == 0
+    int32_t k_q15;     // used if use_q15 == 1
+    uint32_t filtered;
+} iir_cfg_t;
+
+
 // ---- DMA buffer ----
 // Layout: adc_dma_buffer[channel][sample_index 0..3]
 static volatile uint16_t adc_dma_buffer[ADC_CHANNELS_NUM][ADC_SAMPLES_NUM];
@@ -40,8 +49,48 @@ static bool stop_requested     = false;
 static uint32_t partial_sum[ADC_CHANNELS_NUM]; // sum of first half (2 samples)
 static int32_t  filtered[ADC_CHANNELS_NUM];    // IIR state (kept wider for headroom)
 static bool     filter_initialized = false;
-
+static iir_cfg_t cfg;
 //
+
+
+// static inline void iir_update(iir_cfg_t *cfg, uint32_t sum)
+// {
+//     if (!cfg->use_q15) {
+//         // Shift-only mode
+//         int32_t err = (int32_t)sum - (int32_t)cfg->filtered;
+//         int32_t delta = (err + (1 << (cfg->N - 1))) >> cfg->N;  // rounded
+//         cfg->filtered += delta;
+//     } else {
+//         // Q15 mode
+//         int32_t err = (int32_t)sum - (int32_t)cfg->filtered;
+//         int32_t delta = (int32_t)(( (int64_t)err * cfg->k_q15 + (1 << 14) ) >> 15);
+//         cfg->filtered += delta;
+//     }
+// }
+
+static inline void iir_update(iir_cfg_t *cfg, int32_t *state, uint32_t sum)
+{
+    int32_t err = (int32_t)sum - *state;
+
+    if (!cfg->use_q15) {
+        int32_t delta = (err + (1 << (cfg->N - 1))) >> cfg->N;
+        *state += delta;
+    } else {
+        int32_t delta = (int32_t)(((int64_t)err * cfg->k_q15 + (1 << 14)) >> 15);
+        *state += delta;
+    }
+}
+
+
+static inline int32_t alpha_to_q15(float fc, float fs_hz)
+{
+    float alpha = (2.0f * 3.14159265359f * fc) / fs_hz; // α ≈ 2π fc / fs
+    if (alpha < 0.0f) alpha = 0.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+    return (int32_t)lroundf(alpha * 32768.0f);
+}
+
+
 static void adc_process_block(uint16_t * buffer, bool flag);
 // Utility: sleep for microseconds (best-effort on Linux)
 static void sleep_us(long us)
@@ -73,6 +122,18 @@ static void prvCenterPosCompensate(uint16_t *usIn, uint16_t usCenterPos, uint16_
     }
 
     *usIn = (uint16_t)((lDelta + (int32_t)usCenterPos + sCompensation) - usCenterPos);
+}
+
+
+static inline uint32_t median4_u16(uint16_t a, uint16_t b, uint16_t c, uint16_t d) {
+    // Sort network for 4 elements (small & branchless-ish)
+    uint16_t t;
+    if (a > b) { t=a; a=b; b=t; }
+    if (c > d) { t=c; c=d; d=t; }
+    if (a > c) { t=a; a=c; c=t; }
+    if (b > d) { t=b; b=d; d=t; }
+    // Now a<=c and b<=d, median is max(a,c) with min(b,d), approximate with (b+c)/2
+    return ((uint32_t)b + (uint32_t)c) >> 1;
 }
 
 // Callback prototypes
@@ -179,19 +240,30 @@ static void* consumer_thread(void *arg)
                 uint32_t s3 = adc_dma_buffer[ch][3];
                 uint32_t sum4 = partial_sum[ch] + s2 + s3;
 
+                // uint16_t s0 = adc_dma_buffer[ch][0];
+                // uint16_t s1 = adc_dma_buffer[ch][1];
+                // uint16_t s2 = adc_dma_buffer[ch][2];
+                // uint16_t s3 = adc_dma_buffer[ch][3];
+                // uint32_t m = median4_u16(s0, s1, s2, s3);
+
                 // "True" 4x oversampling for +1 bit: sum of 4 then >> 1
                 // Use rounding to reduce bias
                 uint32_t oversampled = (sum4 + 1u) >> 1; // average * 2 (i.e., adds 1 bit of resolution)
+
+                // Scale to match previous dynamic range (×2)
+                // uint32_t oversampled = m << 1;
+
 
                 if (!filter_initialized) {
                     filtered[ch] = (int32_t)oversampled;
                 } else {
                     int32_t err = (int32_t)oversampled - filtered[ch];
-                    if (err > -DEADBAND && err < DEADBAND) {
+                    if (err >= -DEADBAND && err <= DEADBAND) {
                         // hold
                     } else {
-                        int32_t delta = (err + (1 << (IIR_SHIFT_N - 1))) >> IIR_SHIFT_N;
-                        filtered[ch] += delta;
+                        // int32_t delta = (err + (1 << (IIR_SHIFT_N - 1))) >> IIR_SHIFT_N;
+                        // filtered[ch] += delta;
+                        iir_update(&cfg, &filtered[ch], (int32_t)oversampled);
                     }
                 }
             }
@@ -228,7 +300,9 @@ int main()
     printf("Channels=%d, Samples/Ch=%d, ScanPeriod=%dus, IIR alpha=1/2^%d\n",
            ADC_CHANNELS_NUM, ADC_SAMPLES_NUM, SAMPLE_PERIOD_US, IIR_SHIFT_N);
     printf("Expect 1 kHz IIR update rate (4x 250us sequences per frame).\n\n");
-
+cfg.k_q15 = alpha_to_q15(20.0f, 1000.0f);
+cfg.use_q15 = 1;
+cfg.N = 3;
     // Seed global RNG too (not essential)
     srand((unsigned)time(NULL) ^ 0xB16B00B5u);
 
